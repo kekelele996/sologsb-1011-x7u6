@@ -1,18 +1,34 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
+  activeLocks,
   applyRules,
+  bumpTermRulesByColleague,
   cloneModel,
   createInitialModel,
-  mergeConfirmedSegments,
+  LOCK_TTL_MS,
+  lockStatus,
+  migrateModel,
   normalizeNumbers,
+  OPERATORS,
   queueStats,
+  reconcileOfflineChanges,
+  releaseLock,
+  resolveReview,
   STORAGE_KEY,
+  simulateColleagueRelay,
   simulateLatency,
+  submitHandoffConflict,
+  takeOffline,
+  takeoverSegment,
   toSrt,
+  touchLock,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type PendingReview,
+  type RelayOperator,
+  type ReviewDecision,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -31,6 +47,12 @@ function formatAge(timestamp: number): string {
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒前`;
 }
 
+function formatCountdown(ms: number): string {
+  const seconds = Math.max(0, Math.ceil(ms / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
 function stateLabel(state: SegmentState): string {
   return {
     pending: '待确认',
@@ -38,6 +60,7 @@ function stateLabel(state: SegmentState): string {
     duplicate: '重复片段',
     stale: '过期修改',
     ignored: '已忽略',
+    review: '待复核',
   }[state];
 }
 
@@ -217,6 +240,85 @@ export class CaptionDesk extends LitElement {
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .delivery-status.review-status { background: #fff1f1; border-color: #da1e28; color: #a2191f; }
+
+    /* 接力校对 */
+    .operator-switch { display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
+    .operator-switch > span { color: #a8a8a8; font-size: 9px; letter-spacing: .04em; }
+    .operator-switch cds-dropdown { width: 210px; --cds-spacing-02: 0; }
+
+    .segment-card.lock-other { border-left-color: #8d8d8d; }
+    .segment-card.lock-expired { border-left-color: #f1c21b; outline: 1px dashed #f1c21b; }
+    .segment-card.review { border-left-color: #da1e28; }
+    .lock-chip {
+      margin-top: 7px; padding: 4px 8px; display: flex; align-items: center; gap: 7px;
+      background: #f4f4f4; border-left: 2px solid #8d8d8d; font-size: 10px; color: #393939;
+    }
+    .lock-chip.mine { background: #edf5ff; border-color: #0f62fe; color: #0043ce; }
+    .lock-chip.locked { background: #f4f4f4; border-color: #8d8d8d; color: #525252; }
+    .lock-chip.expired { background: #fff8e1; border-color: #f1c21b; color: #684e00; font-weight: 500; }
+    .lock-dot { width: 7px; height: 7px; border-radius: 50%; background: #8d8d8d; flex: 0 0 auto; }
+    .lock-chip.mine .lock-dot { background: #0f62fe; }
+    .lock-chip.expired .lock-dot { background: #f1c21b; }
+    .issue-note.review-note { background: #fff1f1; border-color: #da1e28; color: #a2191f; }
+
+    .relay-banner {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 14px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0);
+      background: #f4f4f4; color: #393939;
+    }
+    .relay-banner.mine { background: #edf5ff; color: #0043ce; }
+    .relay-banner.expired { background: #fff8e1; color: #684e00; }
+    .relay-banner.displaced { background: #fff1f1; color: #a2191f; }
+    .relay-banner-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+    .relay-banner-copy strong { font-size: 12px; }
+    .relay-banner-copy span { font-size: 10px; line-height: 1.45; opacity: .92; }
+    .relay-banner-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+
+    .relay-section { border-top: 2px solid #0f62fe; }
+    .relay-locks { padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .lock-row {
+      display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 9px;
+      border: 1px solid var(--cds-border-subtle, #e0e0e0); background: var(--cds-layer-02, #f4f4f4);
+      color: inherit; text-align: left; cursor: pointer;
+    }
+    .lock-row:hover { outline: 1px solid #78a9ff; }
+    .lock-row .lock-dot { background: #8d8d8d; }
+    .lock-row.mine { border-color: #78a9ff; background: #edf5ff; }
+    .lock-row.mine .lock-dot { background: #0f62fe; }
+    .lock-row.expired { border-color: #f1c21b; background: #fff8e1; }
+    .lock-row.expired .lock-dot { background: #f1c21b; }
+    .lock-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+    .lock-row-main b { font-size: 11px; }
+    .lock-row-main small { font-size: 10px; color: var(--cds-text-secondary, #525252); }
+    .lock-row-epoch { font: 500 9px/1 "IBM Plex Mono", monospace; color: var(--cds-text-secondary, #525252); flex: 0 0 auto; }
+    .relay-empty { padding: 10px 12px; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+    .relay-tools { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 10px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+
+    .review-headline { padding: 9px 12px 5px; display: flex; align-items: baseline; justify-content: space-between; }
+    .review-headline h4 { margin: 0; font-size: 12px; }
+    .review-headline span { font-size: 10px; color: var(--cds-text-secondary, #525252); }
+    .review-headline.has-review h4 { color: #da1e28; }
+    .review-list { padding: 0 8px 8px; display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow: auto; }
+    .review-item { border: 1px solid var(--cds-border-subtle, #e0e0e0); border-left: 3px solid #da1e28; background: var(--cds-layer-02, #f4f4f4); }
+    .review-head { display: flex; align-items: center; gap: 7px; padding: 7px 9px 5px; }
+    .review-seq { font: 500 10px/1 "IBM Plex Mono", monospace; color: var(--cds-text-secondary, #525252); }
+    .review-head time { margin-left: auto; font: 500 9px/1 "IBM Plex Mono", monospace; color: var(--cds-text-secondary, #525252); }
+    .review-reason { margin: 0; padding: 0 9px 7px; font-size: 10px; line-height: 1.5; color: #a2191f; }
+    .review-diff { padding: 0 9px 8px; display: flex; flex-direction: column; gap: 6px; }
+    .review-col { padding: 7px 8px; font-size: 10px; line-height: 1.5; }
+    .review-col span { display: block; font-size: 9px; margin-bottom: 3px; color: var(--cds-text-secondary, #525252); }
+    .review-col p { margin: 0; }
+    .review-col.draft { background: #fff8e1; border-left: 2px solid #f1c21b; }
+    .review-col.live { background: #defbe6; border-left: 2px solid #42be65; }
+    .review-actions { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 9px 9px; }
+
+    .relay-log { padding: 8px 12px 12px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .relay-log h4 { margin: 0 0 6px; font-size: 11px; }
+    .relay-log-row { display: flex; gap: 8px; font-size: 10px; line-height: 1.5; padding: 2px 0; color: var(--cds-text-secondary, #525252); }
+    .relay-log-row time { flex: 0 0 38px; font-family: "IBM Plex Mono", monospace; }
+    .relay-log-row.takeover span, .relay-log-row.review span, .relay-log-row.rules span { color: #a2191f; }
+    .relay-log-row.remote span { color: #0043ce; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -246,14 +348,20 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  /** 每秒变化，驱动占用倒计时与过期状态重算。 */
+  @state() private clock = Date.now();
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
+  private streamTicker?: number;
 
   connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener('keydown', this.handleShortcut);
     this.ticker = window.setInterval(() => {
+      this.clock = Date.now();
+    }, 1_000);
+    this.streamTicker = window.setInterval(() => {
       const next = simulateLatency(this.model);
       const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
       if (!changed) return;
@@ -265,6 +373,7 @@ export class CaptionDesk extends LitElement {
   disconnectedCallback(): void {
     window.removeEventListener('keydown', this.handleShortcut);
     if (this.ticker) window.clearInterval(this.ticker);
+    if (this.streamTicker) window.clearInterval(this.streamTicker);
     super.disconnectedCallback();
   }
 
@@ -272,8 +381,8 @@ export class CaptionDesk extends LitElement {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        const parsed = JSON.parse(raw) as Partial<DeskModel>;
+        if (parsed.segments?.length) return migrateModel(parsed);
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -329,22 +438,61 @@ export class CaptionDesk extends LitElement {
     return this.model.segments.find((item) => item.id === this.model.selectedId);
   }
 
+  private get operator(): RelayOperator {
+    return OPERATORS.find((item) => item.id === this.model.currentOperatorId) ?? OPERATORS[0];
+  }
+
+  private get activeLocksList() {
+    return activeLocks(this.model, this.clock);
+  }
+
   private get stats() {
-    return queueStats(this.model);
+    return queueStats(this.model, this.clock);
   }
 
   private get pendingSegments(): CaptionSegment[] {
     const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate' || item.state === 'review';
+      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate' || item.state === 'review';
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
   }
 
+  /**
+   * 编辑前的接力门控：
+   * - 自己持有占用 → 滑动续期，允许编辑；
+   * - 无占用 → 自动取得占用，允许编辑；
+   * - 别人占用中 → 阻止，提示等过期；
+   * - 别人占用已过期 → 阻止直接改，引导显式接管。
+   * 返回是否允许本次编辑。
+   */
+  private gateEdit(segment: CaptionSegment, silent = false): boolean {
+    const status = lockStatus(segment, this.operator.id, this.clock);
+    if (status === 'mine') {
+      this.model = touchLock(this.model, segment.id, this.operator, this.clock);
+      this.persist();
+      return true;
+    }
+    if (status === 'none') {
+      this.model = touchLock(this.model, segment.id, this.operator, this.clock);
+      this.persist();
+      return true;
+    }
+    if (status === 'locked' && !silent) {
+      const remaining = Math.max(0, Math.ceil((segment.lock!.expiresAt - this.clock) / 1000));
+      this.pushToast('warning', `片段由 ${segment.lock!.holderName} 处理中`, `占用还剩 ${remaining} 秒，过期后可接管；交班请先与对方确认`);
+    }
+    if (status === 'expired' && !silent) {
+      this.pushToast('warning', `${segment.lock!.holderName} 的占用已过期`, '请点击“接管此片段”后再编辑，改动不会覆盖对方留存稿');
+    }
+    return false;
+  }
+
   private updateSelected(patch: Partial<CaptionSegment>, label = ''): void {
     const selected = this.selected;
     if (!selected) return;
+    if (!this.gateEdit(selected)) return;
     this.commit(label, (current) => ({
       ...current,
       segments: current.segments.map((item) => item.id === selected.id ? { ...item, ...patch, revision: item.revision + 1 } : item),
@@ -367,6 +515,7 @@ export class CaptionDesk extends LitElement {
     const selected = this.selected;
     const rule = this.model.rules.find((item) => item.id === ruleId);
     if (!selected || !rule) return;
+    if (!this.gateEdit(selected)) return;
     const flags = rule.caseSensitive ? 'g' : 'gi';
     const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
     if (!expression.test(selected.corrected)) {
@@ -436,10 +585,24 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    const status = lockStatus(selected, this.operator.id, this.clock);
+    if (status === 'locked') {
+      const remaining = Math.max(0, Math.ceil((selected.lock!.expiresAt - this.clock) / 1000));
+      this.pushToast('error', `确认被阻止：${selected.lock!.holderName} 正在处理`, `占用还剩 ${remaining} 秒，请等待过期或与其交班`);
+      return;
+    }
+    if (status === 'expired') {
+      this.pushToast('error', '确认被阻止：占用已过期但你尚未接管', '点击“接管此片段”后再确认，原处理人的稿件会保留待复核');
+      return;
+    }
+    // 状态为 none 时自动取得占用；mine 时滑动续期。
+    if (!this.gateEdit(selected)) return;
+
+    const locked = this.model.segments.find((item) => item.id === selected.id)!;
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
-    this.commit('确认并送入直播区', (current) => ({
+    this.commit(offline ? '已加入离线发件箱' : '确认并送入直播区', (current) => ({
       ...current,
       segments: current.segments.map((item) => item.id === selected.id ? {
         ...item,
@@ -447,14 +610,116 @@ export class CaptionDesk extends LitElement {
         state: 'confirmed',
         source: offline ? 'offline' : item.source,
         confirmedAt: Date.now(),
+        confirmedBy: this.operator.name,
         staleReason: item.state === 'stale' ? item.staleReason : undefined,
         tags: used.length ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
         revision: item.revision + 1,
+        lock: undefined,
+        // 带着下手时的片段版本与术语规则版本，恢复后用于冲突判定。
+        offlineBaseRevision: offline ? item.lock?.baseRevision ?? item.revision : undefined,
+        offlineBaseRulesVersion: offline ? item.lock?.baseRulesVersion ?? current.rulesVersion : undefined,
+        offlineDraftSpeaker: offline ? item.speaker : undefined,
+        offlineDraftText: offline ? text : undefined,
       } : item),
       rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
       selectedId: nextOrder[0]?.id ?? selected.id,
     }));
-    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
+    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? `按片段 r${locked.lock?.baseRevision ?? selected.revision} / 规则 v${locked.lock?.baseRulesVersion ?? this.model.rulesVersion} 暂存，恢复后按顺序合并` : `第 ${selected.sequence} 段已确认`);
+  }
+
+  private takeoverSelected(): void {
+    const selected = this.selected;
+    if (!selected?.lock) return;
+    const status = lockStatus(selected, this.operator.id, this.clock);
+    if (status === 'mine' || status === 'none') return;
+    if (status === 'locked') {
+      const remaining = Math.max(0, Math.ceil((selected.lock.expiresAt - this.clock) / 1000));
+      this.pushToast('error', '占用尚未过期，不能接管', `还剩 ${remaining} 秒；请先让 ${selected.lock.holderName} 交班释放`);
+      return;
+    }
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = takeoverSegment(this.model, selected.id, this.operator, this.clock);
+    this.persist();
+    this.pushToast('success', `已接管第 ${selected.sequence} 段`, `${selected.lock.holderName} 的稿件已保留为待复核内容，不会被覆盖`);
+  }
+
+  private releaseSelectedLock(): void {
+    const selected = this.selected;
+    if (!selected?.lock) return;
+    const next = releaseLock(this.model, selected.id, this.operator.id, this.clock);
+    if (next === this.model) {
+      this.pushToast('info', '只有当前持有人能释放占用', `当前持有人为 ${selected.lock.holderName}`);
+      return;
+    }
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.model = next;
+    this.persist();
+    this.pushToast('info', `已释放第 ${selected.sequence} 段的占用`, '同事可以立即接手，不必等待过期');
+  }
+
+  /** 被接管的原处理人再次提交：生成交接冲突，绝不直接覆盖直播区。 */
+  private submitRetainedDraft(): void {
+    const selected = this.selected;
+    if (!selected) return;
+    const result = submitHandoffConflict(this.model, selected.id, this.operator, this.clock);
+    if (result.reason === 'not-handoff') {
+      this.pushToast('info', '没有可提交的留存稿', '只有被接管的原处理人才能提交交接冲突');
+      return;
+    }
+    if (result.reason === 'duplicate') {
+      this.pushToast('warning', '交接冲突已在待复核队列', '请等待人工裁决，不要重复提交');
+      return;
+    }
+    this.model = result.model;
+    this.persist();
+    this.pushToast('error', `交接冲突：第 ${selected.sequence} 段未写入直播区`, `你的留存稿与 ${result.review?.confirmedByName} 的处理版本已按顺序列入待复核`);
+  }
+
+  private switchOperator(operatorId: string): void {
+    if (operatorId === this.operator.id) return;
+    const target = OPERATORS.find((item) => item.id === operatorId);
+    this.model = { ...this.model, currentOperatorId: operatorId, updatedAt: Date.now() };
+    this.persist();
+    this.pushToast('info', `已切换为 ${target?.name ?? operatorId}`, '其他校对员占用中的片段会显示倒计时，过期后可接管');
+  }
+
+  private simulateColleague(): void {
+    const next = simulateColleagueRelay(this.model, this.clock);
+    if (next === this.model) {
+      this.pushToast('info', '同事暂时没有可处理的空闲片段', '等占用过期后再模拟交班');
+      return;
+    }
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = next;
+    this.persist();
+    this.pushToast('info', '已模拟同事 / 交班端的动作', this.model.connection === 'offline' ? '另一端确认了离线发件箱中的片段，恢复后将产生冲突' : '片段占用或确认状态已变化');
+  }
+
+  private bumpRules(): void {
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = bumpTermRulesByColleague(this.model, this.clock);
+    this.persist();
+    this.pushToast('warning', `术语规则已更新至 v${this.model.rulesVersion}`, '离线期间按旧规则下手的改动，恢复后将进入待复核');
+  }
+
+  private handleReview(review: PendingReview, decision: ReviewDecision): void {
+    this.model = resolveReview(this.model, review.id, decision, this.clock);
+    this.persist();
+    this.pushToast('success', `第 ${review.sequence} 段冲突已处理`, `操作：${this.reviewDecisionLabel(decision)}`);
+  }
+
+  private reviewDecisionLabel(decision: ReviewDecision): string {
+    return {
+      'apply-draft': '采用留存 / 离线稿',
+      'keep-current': '保留当前版本',
+      discard: '舍弃留存稿',
+      replay: '用离线稿重放进直播区',
+      'keep-live': '保留直播区版本',
+      recheck: '退回待确认按新规则复核',
+    }[decision];
   }
 
   private ignoreSelected(): void {
@@ -478,21 +743,36 @@ export class CaptionDesk extends LitElement {
   }
 
   private setConnection(connection: ConnectionState): void {
-    this.commit(connection === 'offline' ? '切换到离线校正' : connection === 'degraded' ? '模拟延迟波动' : '连接已恢复', (current) => ({
-      ...current,
-      connection,
-      simulatedDelay: connection === 'connected' ? 0.8 : connection === 'degraded' ? 4.6 : current.simulatedDelay,
-    }));
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    if (connection === 'offline') {
+      this.model = takeOffline(this.model, this.clock);
+    } else {
+      this.commit(connection === 'degraded' ? '模拟延迟波动' : '连接已恢复', (current) => ({
+        ...current,
+        connection,
+        simulatedDelay: connection === 'connected' ? 0.8 : 4.6,
+      }));
+      return;
+    }
+    this.persist();
+    this.pushToast('warning', '切换到离线校正', '确认仍可继续，提交会携带下手版本；恢复后冲突会按顺序进入待复核');
   }
 
   private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
-    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    const previous = cloneModel(this.model);
+    const merged = reconcileOfflineChanges(this.model);
+    const created = merged.reviews.length - previous.reviews.length;
+    const outboxCount = merged.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
     this.future = [];
     this.model = merged;
     this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    if (created > 0) {
+      this.pushToast('error', `离线队列已合并，${created} 条冲突待复核`, '被他人确认或术语规则改版的旧改动没有进入直播区');
+    } else {
+      this.pushToast('success', '离线队列已按顺序合并', outboxCount ? `${outboxCount} 个片段仍标记为离线来源` : '无版本冲突，全部进入直播区');
+    }
   }
 
   private addRuleFromSelection(): void {
@@ -513,6 +793,7 @@ export class CaptionDesk extends LitElement {
     }
     this.commit('新增术语快捷规则', (current) => ({
       ...current,
+      rulesVersion: current.rulesVersion + 1,
       rules: [{
         id: `term-${Date.now().toString(36)}`,
         source,
@@ -528,10 +809,11 @@ export class CaptionDesk extends LitElement {
     this.ruleReplacement = '';
     this.ruleSpeaker = '';
     this.showRuleForm = false;
+    this.pushToast('warning', `术语规则已更新至 v${this.model.rulesVersion}`, '离线期间的旧改动恢复时会要求按新规则复核');
   }
 
   private deleteRule(id: string): void {
-    this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
+    this.commit('删除术语规则', (current) => ({ ...current, rulesVersion: current.rulesVersion + 1, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
   private exportSrt(): void {
@@ -601,14 +883,27 @@ export class CaptionDesk extends LitElement {
     }
     return html`
       <div class="segment-list">
-        ${segments.map((item) => html`
-          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
+        ${segments.map((item) => {
+          const status = lockStatus(item, this.operator.id, this.clock);
+          const remaining = item.lock ? item.lock.expiresAt - this.clock : 0;
+          return html`
+          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state} ${status === 'expired' ? 'lock-expired' : ''} ${status === 'locked' ? 'lock-other' : ''}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
               <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
             </div>
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
+            ${item.lock ? html`
+              <div class="lock-chip ${status}">
+                <span class="lock-dot"></span>
+                ${status === 'mine'
+                  ? html`我在处理 · 还可占用 ${formatCountdown(remaining)}（编辑自动续期）`
+                  : status === 'locked'
+                    ? html`${item.lock.holderName} 处理中 · 剩 ${formatCountdown(remaining)}`
+                    : html`${item.lock.holderName} 的占用已过期 ${formatCountdown(-remaining)} · 可接管`}
+              </div>
+            ` : nothing}
             <div class="segment-foot">
               <span>${item.speaker}</span>
               <span>·</span>
@@ -617,8 +912,9 @@ export class CaptionDesk extends LitElement {
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
-          </button>
-        `)}
+            ${item.state === 'review' ? html`<div class="issue-note review-note">${item.staleReason || '该片段有待复核冲突'}，请在右侧接力校对面板决定。</div>` : nothing}
+          </button>`;
+        })}
       </div>
     `;
   }
@@ -629,6 +925,10 @@ export class CaptionDesk extends LitElement {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
     }
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+    const status = lockStatus(item, this.operator.id, this.clock);
+    const remaining = item.lock ? item.lock.expiresAt - this.clock : 0;
+    const readOnly = status === 'locked' || status === 'expired';
+    const iAmDisplaced = !!item.handoff && item.handoff.operatorId === this.operator.id && item.lock?.holderId !== this.operator.id;
     return html`
       <div class="editor-scroll">
         <div class="editor-card">
@@ -638,10 +938,42 @@ export class CaptionDesk extends LitElement {
               <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
-              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
-              <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
+              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : item.state === 'review' ? 'red' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
+              <cds-tag type="outline" size="sm">修改 ${item.revision} 次 · 规则 v${item.lock?.baseRulesVersion ?? this.model.rulesVersion}</cds-tag>
             </div>
           </div>
+          ${item.lock ? html`
+            <div class="relay-banner ${status}">
+              <div class="relay-banner-copy">
+                <strong>${status === 'mine'
+                  ? `我正在处理（第 ${item.lock.epoch} 任）`
+                  : `${item.lock.holderName} 正在处理（第 ${item.lock.epoch} 任）`}</strong>
+                <span>${status === 'mine'
+                  ? `占用还剩 ${formatCountdown(remaining)}，每次编辑自动续期 ${Math.round(LOCK_TTL_MS / 1000)} 秒；基于片段 r${item.lock.baseRevision} / 规则 v${item.lock.baseRulesVersion}`
+                  : status === 'locked'
+                    ? `占用还剩 ${formatCountdown(remaining)}，到期前不能改动；交班时可请对方释放`
+                    : `占用已过期 ${formatCountdown(-remaining)}，可以接管；对方的稿件会保留为待复核内容`}</span>
+              </div>
+              <div class="relay-banner-actions">
+                ${status === 'mine'
+                  ? html`<cds-button kind="ghost" size="sm" @click=${this.releaseSelectedLock}>交班释放</cds-button>`
+                  : status === 'expired'
+                    ? html`<cds-button kind="primary" size="sm" @click=${this.takeoverSelected}>接管此片段</cds-button>`
+                    : html`<cds-tag type="warm-gray" size="sm">占用中</cds-tag>`}
+              </div>
+            </div>
+          ` : nothing}
+          ${iAmDisplaced ? html`
+            <div class="relay-banner displaced">
+              <div class="relay-banner-copy">
+                <strong>你已被第 ${item.lock?.epoch ?? ''} 任处理人接管</strong>
+                <span>你的留存稿“${item.handoff!.text.slice(0, 26)}${item.handoff!.text.length > 26 ? '…' : ''}”保留中；直接确认不会覆盖对方，会转入待复核。</span>
+              </div>
+              <div class="relay-banner-actions">
+                <cds-button kind="danger--tertiary" size="sm" @click=${this.submitRetainedDraft}>提交我的留存稿（交接冲突）</cds-button>
+              </div>
+            </div>
+          ` : nothing}
           <div class="editor-form">
             ${item.state === 'duplicate' ? html`
               <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
@@ -651,8 +983,11 @@ export class CaptionDesk extends LitElement {
             ${item.state === 'stale' ? html`
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
+            ${readOnly ? html`
+              <cds-inline-notification kind="info" low-contrast title="接力占用保护中" subtitle=${status === 'locked' ? '当前片段由其他校对员占用，编辑已锁定以防互相覆盖。' : '占用已过期，请先显式接管再编辑。'}></cds-inline-notification>
+            ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
+              <cds-select label-text="发言人" value=${item.speaker} ?disabled=${readOnly} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
                 ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
@@ -662,34 +997,140 @@ export class CaptionDesk extends LitElement {
               label-text="校对后的字幕文本"
               helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用"
               .value=${item.corrected}
+              ?disabled=${readOnly}
               @input=${(event: Event) => this.updateSelected({ corrected: (event.currentTarget as any).value }, '')}
             ></cds-textarea>
             <div class="edit-toolbar">
               <span>快速标点</span>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
-              <cds-button kind="secondary" size="sm" @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${readOnly} @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${readOnly} @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${readOnly} @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${readOnly} @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${readOnly} @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
+              <cds-button kind="secondary" size="sm" ?disabled=${readOnly} @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
             </div>
             <div class="rule-suggestions">
-              <small>术语快捷替换</small>
+              <small>术语快捷替换（v${this.model.rulesVersion}）</small>
               ${applicableRules.length ? applicableRules.map((rule) => html`
-                <cds-button kind="tertiary" size="sm" @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
+                <cds-button kind="tertiary" size="sm" ?disabled=${readOnly} @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
               `) : html`<small>当前发言人的规则为空</small>`}
               <cds-button kind="ghost" size="sm" @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段 · 他人占用中的片段无法确认</div>
             <div>
               <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="primary" ?disabled=${readOnly} @click=${this.confirmSelected}>确认并送入直播区</cds-button>
             </div>
           </div>
         </div>
       </div>
+    `;
+  }
+
+  private renderReviewDiff(review: PendingReview) {
+    const kindLabel = {
+      handoff: '交接冲突',
+      'remote-confirmed': '已被他人确认',
+      'rules-changed': '术语规则已改版',
+    }[review.kind];
+    const kindType = review.kind === 'handoff' ? 'purple' : review.kind === 'remote-confirmed' ? 'red' : 'warm-gray';
+    return html`
+      <article class="review-item">
+        <header class="review-head">
+          <cds-tag type=${kindType as 'purple'} size="sm">${kindLabel}</cds-tag>
+          <span class="review-seq">#${String(review.sequence).padStart(3, '0')}</span>
+          <time>${new Date(review.submittedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time>
+        </header>
+        <p class="review-reason">${review.reason}</p>
+        <div class="review-diff">
+          <div class="review-col draft">
+            <span>${review.submittedByName} 的提交（r${review.draftRevision} / 规则 v${review.draftRulesVersion}）</span>
+            <p><b>[${review.draftSpeaker}]</b> ${review.draftText}</p>
+          </div>
+          ${review.kind !== 'handoff' || review.liveText !== review.draftText ? html`
+            <div class="review-col live">
+              <span>${review.kind === 'rules-changed' ? `直播区现行内容（规则 v${review.liveRulesVersion}）` : `直播区版本 · ${review.confirmedByName ?? ''}`}</span>
+              <p><b>[${review.liveSpeaker}]</b> ${review.liveText}</p>
+            </div>
+          ` : nothing}
+        </div>
+        <div class="review-actions">
+          ${review.kind === 'handoff' ? html`
+            <cds-button size="sm" kind="primary" @click=${() => this.handleReview(review, 'apply-draft')}>采用留存稿继续校对</cds-button>
+            <cds-button size="sm" kind="secondary" @click=${() => this.handleReview(review, 'keep-current')}>保留当前版本</cds-button>
+            <cds-button size="sm" kind="ghost" @click=${() => this.handleReview(review, 'discard')}>舍弃留存稿</cds-button>
+          ` : review.kind === 'remote-confirmed' ? html`
+            <cds-button size="sm" kind="primary" @click=${() => this.handleReview(review, 'replay')}>用我的离线稿重放</cds-button>
+            <cds-button size="sm" kind="secondary" @click=${() => this.handleReview(review, 'keep-live')}>保留直播区版本</cds-button>
+            <cds-button size="sm" kind="ghost" @click=${() => this.handleReview(review, 'discard')}>舍弃离线稿</cds-button>
+          ` : html`
+            <cds-button size="sm" kind="primary" @click=${() => this.handleReview(review, 'recheck')}>退回待确认，按新规则复核</cds-button>
+            <cds-button size="sm" kind="secondary" @click=${() => this.handleReview(review, 'apply-draft')}>确认旧规则版本</cds-button>
+            <cds-button size="sm" kind="ghost" @click=${() => this.handleReview(review, 'discard')}>舍弃离线稿</cds-button>
+          `}
+        </div>
+      </article>
+    `;
+  }
+
+  private renderRelayPanel() {
+    const locks = this.activeLocksList;
+    const heldByMe = locks.filter((entry) => entry.status === 'mine').length;
+    const heldByOthers = locks.filter((entry) => entry.status === 'locked').length;
+    const expired = locks.filter((entry) => entry.status === 'expired').length;
+    const reviews = [...this.model.reviews].sort((a, b) => a.submittedAt - b.submittedAt);
+    const log = [...this.model.relayLog].reverse().slice(0, 8);
+    return html`
+      <section class="inspector-section relay-section">
+        <div class="inspector-section-head">
+          <h3>接力校对</h3>
+          <span>${heldByMe} 段我占 · ${heldByOthers} 段同事占 · ${expired} 段可接管</span>
+        </div>
+        <div class="relay-locks">
+          ${locks.length ? locks.map(({ segment, lock, status, remainingMs }) => html`
+            <button class="lock-row ${status}" @click=${() => this.selectSegment(segment.id)}>
+              <span class="lock-dot"></span>
+              <span class="lock-row-main">
+                <b>#${String(segment.sequence).padStart(3, '0')} · ${status === 'mine' ? '我' : lock.holderName}</b>
+                <small>${status === 'mine'
+                  ? `我在处理，剩 ${formatCountdown(remainingMs)}`
+                  : status === 'locked'
+                    ? `占用中，剩 ${formatCountdown(remainingMs)}`
+                    : `已过期 ${formatCountdown(-remainingMs)}，点击接管`}</small>
+              </span>
+              <span class="lock-row-epoch">第 ${lock.epoch} 任</span>
+            </button>
+          `) : html`<div class="relay-empty">当前没有任何片段被占用，编辑片段会自动取得 ${Math.round(LOCK_TTL_MS / 1000)} 秒占用。</div>`}
+        </div>
+        <div class="relay-tools">
+          <cds-button kind="ghost" size="sm" @click=${this.simulateColleague}>
+            ${this.model.connection === 'offline' ? '模拟同事在另一端确认' : '模拟同事处理 / 交班'}
+          </cds-button>
+          <cds-button kind="ghost" size="sm" @click=${this.bumpRules}>模拟规则改版 v${this.model.rulesVersion + 1}</cds-button>
+        </div>
+
+        <div class="review-headline ${reviews.length ? 'has-review' : ''}">
+          <h4>待复核冲突</h4>
+          <span>按发生时间排序 · ${reviews.length} 条未裁决</span>
+        </div>
+        <div class="review-list">
+          ${reviews.length
+            ? reviews.map((review) => this.renderReviewDiff(review))
+            : html`<div class="relay-empty">没有待复核内容。接管、交接冲突和离线版本冲突会出现在这里，直播区不会被静默覆盖。</div>`}
+        </div>
+
+        <div class="relay-log">
+          <h4>接力动态</h4>
+          ${log.map((event) => html`
+            <div class="relay-log-row ${event.kind}">
+              <time>${new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time>
+              <span>${event.text}</span>
+            </div>
+          `)}
+        </div>
+      </section>
     `;
   }
 
@@ -698,10 +1139,11 @@ export class CaptionDesk extends LitElement {
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
     return html`
       <div class="inspector">
+        ${this.renderRelayPanel()}
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
-            <span>${this.model.rules.filter((rule) => rule.enabled).length} 条启用</span>
+            <span>v${this.model.rulesVersion} · ${this.model.rules.filter((rule) => rule.enabled).length} 条启用</span>
           </div>
           <div class="rule-list">
             ${this.model.rules.map((rule) => html`
@@ -739,11 +1181,12 @@ export class CaptionDesk extends LitElement {
               <article class="live-item">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
                 <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                <small>${segment.source === 'offline' ? '离线来源 · 恢复后合并' : `确认人：${segment.confirmedBy ?? '本地校对员'}`}</small>
               </article>
             `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并，均带着下手版本。恢复后已被他人确认或规则改版的旧改动不会进入直播区，会列入待复核。</div>` : nothing}
+          ${this.model.reviews.length ? html`<div class="delivery-status review-status">有 ${this.model.reviews.length} 条待复核冲突等待人工裁决，直播区保持当前版本不变。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -780,10 +1223,18 @@ export class CaptionDesk extends LitElement {
             <span class="connection-dot"></span>
             <div class="connection-copy">
               <strong>${connectionLabel(this.model.connection)} · ${this.model.simulatedDelay.toFixed(1)} 秒延迟</strong>
-              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
+              <small>${this.model.connection === 'offline'
+                ? '仍可编辑，确认内容携带下手版本进入离线发件箱'
+                : `待确认 ${stats.pending} 段 · 同事占用 ${stats.locksHeldByOthers} · 待复核 ${stats.review} · 自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
             </div>
           </div>
           <div class="header-actions">
+            <label class="operator-switch">
+              <span>当前校对员</span>
+              <cds-dropdown size="sm" value=${this.operator.id} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => this.switchOperator(event.detail.item.value)}>
+                ${OPERATORS.map((operator) => html`<cds-dropdown-item value=${operator.id}>${operator.name}</cds-dropdown-item>`)}
+              </cds-dropdown>
+            </label>
             <cds-button kind="ghost" size="sm" @click=${this.toggleTheme}>${this.dark ? '浅色界面' : '深色值守'}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.undo}>撤销</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.redo}>重做</cds-button>
@@ -793,13 +1244,13 @@ export class CaptionDesk extends LitElement {
 
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱并携带下手版本' : stats.review > 0 ? `${stats.review} 条接力/版本冲突待复核，请先裁决再继续` : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline} · 待复核 ${stats.review}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
-          <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
+          <div class="status-cell ${stats.review > 0 ? 'danger' : ''}"><strong>${stats.stale + stats.duplicate + stats.review}</strong><span>需人工处理 / 复核</span></div>
           <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
@@ -814,7 +1265,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>待确认区</h2>
-                <p>按收到顺序排列，重复和过期内容不会被静默覆盖</p>
+                <p>按收到顺序排列；占用、交接冲突与待复核状态一目了然</p>
               </div>
               <cds-dropdown value=${this.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.filter = event.detail.item.value as typeof this.filter; }}>
                 <cds-dropdown-item value="active">仅需处理</cds-dropdown-item>
@@ -839,8 +1290,8 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>接力、规则与直播区</h2>
+                <p>占用可接力；离线旧改动与规则改版冲突统一进入待复核</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
